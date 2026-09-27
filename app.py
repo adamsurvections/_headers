@@ -4,9 +4,11 @@ Runs entirely on your own machine: no account, no cloud upload, no usage quota,
 no watermark. AI models are downloaded once from Hugging Face and cached locally.
 
 Tabs:
-  1. Adjust       - classic edits (rotate, flip, crop-to-square, resize, colour, blur, sharpen)
-  2. AI Edit      - describe a change in plain English ("make it winter")  [InstructPix2Pix]
-  3. AI Inpaint   - paint over an area and describe what should replace it [SD inpainting]
+  1. AI Edit      - upload a photo, describe the change, get the edited image
+                    Best:  Qwen-Image-Edit-2509 (state-of-the-art open editing model)
+                    Light: InstructPix2Pix (runs on modest hardware)
+  2. AI Inpaint   - paint over an area and describe what should replace it [SD inpainting]
+  3. Adjust       - classic edits (rotate, flip, crop-to-square, resize, colour, blur, sharpen)
   4. Remove BG    - cut the subject out onto a transparent background      [rembg, optional]
 
 Heavy libraries (torch, diffusers, rembg) are imported lazily, so the Adjust tab
@@ -20,7 +22,11 @@ import gradio as gr
 import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
+QWEN_EDIT_MODEL = "Qwen/Qwen-Image-Edit-2509"
 INSTRUCT_MODEL = "timbrooks/instruct-pix2pix"
+SAFETY_MODEL = "CompVis/stable-diffusion-safety-checker"
+ENGINE_BEST = "Best quality (Qwen-Image-Edit)"
+ENGINE_LIGHT = "Light / fast (InstructPix2Pix)"
 INPAINT_MODEL = "stable-diffusion-v1-5/stable-diffusion-inpainting"
 
 
@@ -57,6 +63,53 @@ def _instruct_pipe():
 
 
 @functools.cache
+def _qwen_pipe(low_vram):
+    """Qwen-Image-Edit is ~20B params. low_vram=True loads it 4-bit (NVIDIA only) so it fits ~16 GB cards."""
+    import torch
+    from diffusers import QwenImageEditPlusPipeline
+
+    device, _ = _device()
+    kwargs = {"torch_dtype": torch.bfloat16}
+    if low_vram and device == "cuda":  # bitsandbytes is NVIDIA-only; ignored elsewhere
+        from diffusers.quantizers import PipelineQuantizationConfig
+
+        kwargs["quantization_config"] = PipelineQuantizationConfig(
+            quant_backend="bitsandbytes_4bit",
+            quant_kwargs={
+                "load_in_4bit": True,
+                "bnb_4bit_quant_type": "nf4",
+                "bnb_4bit_compute_dtype": torch.bfloat16,
+            },
+            components_to_quantize=["transformer", "text_encoder"],
+        )
+    pipe = QwenImageEditPlusPipeline.from_pretrained(QWEN_EDIT_MODEL, **kwargs)
+    if device == "cuda":
+        pipe.enable_model_cpu_offload()  # only the active sub-model sits on the GPU
+    else:
+        pipe = pipe.to(device)
+    return pipe
+
+
+@functools.cache
+def _safety_checker():
+    from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
+    from transformers import CLIPImageProcessor
+
+    return StableDiffusionSafetyChecker.from_pretrained(SAFETY_MODEL), CLIPImageProcessor.from_pretrained(SAFETY_MODEL)
+
+
+def _safe(img):
+    """Blank sexually explicit output. The editor works on real photos, so this stays on."""
+    checker, processor = _safety_checker()
+    clip_input = processor(images=img, return_tensors="pt").pixel_values
+    _, flagged = checker(clip_input=clip_input, images=[np.array(img)])
+    if flagged[0]:
+        gr.Warning("Explicit content was detected, so the output was blanked. Try a different prompt or seed.")
+        return Image.new("RGB", img.size)
+    return img
+
+
+@functools.cache
 def _inpaint_pipe():
     from diffusers import AutoPipelineForInpainting
 
@@ -80,13 +133,6 @@ def _fit(img, max_side):
     scale = min(1.0, max_side / max(w, h))
     w, h = int(w * scale) // 8 * 8, int(h * scale) // 8 * 8
     return img.resize((max(w, 8), max(h, 8)), Image.LANCZOS)
-
-
-def _check_nsfw(result, output):
-    flags = getattr(result, "nsfw_content_detected", None)
-    if flags and any(flags):
-        gr.Warning("The model's built-in safety checker blanked this output. Try a different prompt or seed.")
-    return output
 
 
 # ---------------------------------------------------------------------------
@@ -130,22 +176,44 @@ def adjust(img, rotate, flip_h, flip_v, square, width, brightness, contrast, sat
 # Tab 2: instruction-based edit
 # ---------------------------------------------------------------------------
 
-def ai_edit(img, instruction, steps, text_cfg, image_cfg, max_side, seed, progress=gr.Progress(track_tqdm=True)):
+def ai_edit(img, ref, instruction, engine, steps, strength, keep, low_vram, seed, progress=gr.Progress(track_tqdm=True)):
     if img is None:
         raise gr.Error("Upload an image first.")
     if not instruction.strip():
-        raise gr.Error("Describe the edit you want, e.g. 'turn the sky into a sunset'.")
-    pipe = _instruct_pipe()
+        raise gr.Error("Describe the edit you want, e.g. 'replace the background with a beach at sunset'.")
     gen, seed = _generator(seed)
-    result = pipe(
-        instruction,
-        image=_fit(img.convert("RGB"), max_side),
-        num_inference_steps=int(steps),
-        guidance_scale=text_cfg,
-        image_guidance_scale=image_cfg,
-        generator=gen,
-    )
-    return _check_nsfw(result, result.images[0]), seed
+    img = img.convert("RGB")
+
+    if engine == ENGINE_BEST:
+        pipe = _qwen_pipe(bool(low_vram) and _device()[0] == "cuda")
+        images = [img] + ([ref.convert("RGB")] if ref is not None else [])
+        out = pipe(
+            image=images if len(images) > 1 else img,
+            prompt=instruction,
+            negative_prompt=" ",  # enables true classifier-free guidance
+            true_cfg_scale=strength,
+            num_inference_steps=int(steps),
+            generator=gen,
+        ).images[0]
+    else:
+        if ref is not None:
+            gr.Warning("The light engine ignores the reference image.")
+        pipe = _instruct_pipe()
+        out = pipe(
+            instruction,
+            image=_fit(img, 768),
+            num_inference_steps=int(steps),
+            guidance_scale=strength * 1.9,  # map the shared 1-10 slider onto this model's range
+            image_guidance_scale=keep,
+            generator=gen,
+        ).images[0]
+    return _safe(out), seed
+
+
+def use_result(img):
+    if img is None:
+        raise gr.Error("Nothing to keep editing yet.")
+    return img
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +261,7 @@ def ai_inpaint(editor, prompt, negative, steps, cfg, strength, max_side, seed, p
     # Keep untouched pixels identical to the original.
     soft = mask.resize(orig_size).filter(ImageFilter.GaussianBlur(4))
     out = Image.composite(out, orig, soft)
-    return _check_nsfw(result, out), mask, seed
+    return _safe(out), mask, seed
 
 
 # ---------------------------------------------------------------------------
@@ -218,50 +286,45 @@ def build_ui():
     with gr.Blocks(title="Local AI Image Editor") as demo:
         gr.Markdown(
             "# Local AI Image Editor\n"
-            "Everything runs on this computer. The first AI edit downloads its model (~2-5 GB) once."
+            "Everything runs on this computer. The first use of each AI engine downloads its model once "
+            "(Best engine: ~60 GB, Light: ~2 GB)."
         )
 
-        with gr.Tab("Adjust"):
-            with gr.Row():
-                with gr.Column():
-                    a_in = gr.Image(type="pil", label="Image")
-                    with gr.Row():
-                        a_rot = gr.Slider(-180, 180, 0, step=90, label="Rotate (degrees)")
-                        a_width = gr.Number(0, label="Resize to width (0 = keep)", precision=0)
-                    with gr.Row():
-                        a_fh = gr.Checkbox(label="Flip horizontal")
-                        a_fv = gr.Checkbox(label="Flip vertical")
-                        a_sq = gr.Checkbox(label="Crop to square")
-                        a_gray = gr.Checkbox(label="Black & white")
-                    a_bri = gr.Slider(0, 2, 1, step=0.05, label="Brightness")
-                    a_con = gr.Slider(0, 2, 1, step=0.05, label="Contrast")
-                    a_sat = gr.Slider(0, 2, 1, step=0.05, label="Saturation")
-                    a_shp = gr.Slider(0, 3, 1, step=0.1, label="Sharpness")
-                    a_blur = gr.Slider(0, 20, 0, step=0.5, label="Blur")
-                    a_btn = gr.Button("Apply", variant="primary")
-                a_out = gr.Image(type="pil", label="Result", format="png")
-            a_btn.click(
-                adjust,
-                [a_in, a_rot, a_fh, a_fv, a_sq, a_width, a_bri, a_con, a_sat, a_shp, a_blur, a_gray],
-                a_out,
-            )
-
         with gr.Tab("AI Edit"):
+            gr.Markdown("Upload a photo and describe the change. Add an optional second image to combine, e.g. *put the product from image 2 on the table in image 1*.")
             with gr.Row():
                 with gr.Column():
-                    e_in = gr.Image(type="pil", label="Image")
-                    e_prompt = gr.Textbox(label="Instruction", placeholder="e.g. make it look like a watercolor painting")
+                    with gr.Row():
+                        e_in = gr.Image(type="pil", label="Image to edit")
+                        e_ref = gr.Image(type="pil", label="Reference image (optional)")
+                    e_prompt = gr.Textbox(
+                        label="What should change?",
+                        lines=3,
+                        placeholder="e.g. change the background to a modern office, keep the person exactly the same",
+                    )
+                    e_engine = gr.Radio([ENGINE_BEST, ENGINE_LIGHT], value=ENGINE_BEST, label="Engine")
                     with gr.Accordion("Settings", open=False):
-                        e_steps = gr.Slider(5, 100, 30, step=1, label="Steps (more = slower, finer)")
-                        e_tcfg = gr.Slider(1, 15, 7.5, step=0.5, label="Instruction strength")
-                        e_icfg = gr.Slider(0.5, 3, 1.5, step=0.1, label="Keep-original strength")
-                        e_max = gr.Slider(256, 1024, 512, step=64, label="Max working size (px)")
+                        e_steps = gr.Slider(10, 60, 40, step=1, label="Steps (more = slower, finer)")
+                        e_str = gr.Slider(1, 10, 4, step=0.5, label="Prompt strength")
+                        e_keep = gr.Slider(0.5, 3, 1.5, step=0.1, label="Keep-original strength (light engine)")
+                        e_lowvram = gr.Checkbox(True, label="Low-VRAM 4-bit mode (NVIDIA only; untick if you have 48 GB+ VRAM)")
                         e_seed = gr.Number(-1, label="Seed (-1 = random)", precision=0)
                     e_btn = gr.Button("Edit", variant="primary")
                 with gr.Column():
                     e_out = gr.Image(type="pil", label="Result", format="png")
+                    e_again = gr.Button("Keep editing this result")
                     e_used = gr.Number(label="Seed used", interactive=False)
-            e_btn.click(ai_edit, [e_in, e_prompt, e_steps, e_tcfg, e_icfg, e_max, e_seed], [e_out, e_used])
+            e_btn.click(
+                ai_edit,
+                [e_in, e_ref, e_prompt, e_engine, e_steps, e_str, e_keep, e_lowvram, e_seed],
+                [e_out, e_used],
+            )
+            e_prompt.submit(
+                ai_edit,
+                [e_in, e_ref, e_prompt, e_engine, e_steps, e_str, e_keep, e_lowvram, e_seed],
+                [e_out, e_used],
+            )
+            e_again.click(use_result, e_out, e_in)
 
         with gr.Tab("AI Inpaint"):
             gr.Markdown("Upload an image, **paint over** the part to replace, then describe what should go there.")
@@ -291,6 +354,31 @@ def build_ui():
                 ai_inpaint,
                 [i_in, i_prompt, i_neg, i_steps, i_cfg, i_str, i_max, i_seed],
                 [i_out, i_mask, i_used],
+            )
+
+        with gr.Tab("Adjust"):
+            with gr.Row():
+                with gr.Column():
+                    a_in = gr.Image(type="pil", label="Image")
+                    with gr.Row():
+                        a_rot = gr.Slider(-180, 180, 0, step=90, label="Rotate (degrees)")
+                        a_width = gr.Number(0, label="Resize to width (0 = keep)", precision=0)
+                    with gr.Row():
+                        a_fh = gr.Checkbox(label="Flip horizontal")
+                        a_fv = gr.Checkbox(label="Flip vertical")
+                        a_sq = gr.Checkbox(label="Crop to square")
+                        a_gray = gr.Checkbox(label="Black & white")
+                    a_bri = gr.Slider(0, 2, 1, step=0.05, label="Brightness")
+                    a_con = gr.Slider(0, 2, 1, step=0.05, label="Contrast")
+                    a_sat = gr.Slider(0, 2, 1, step=0.05, label="Saturation")
+                    a_shp = gr.Slider(0, 3, 1, step=0.1, label="Sharpness")
+                    a_blur = gr.Slider(0, 20, 0, step=0.5, label="Blur")
+                    a_btn = gr.Button("Apply", variant="primary")
+                a_out = gr.Image(type="pil", label="Result", format="png")
+            a_btn.click(
+                adjust,
+                [a_in, a_rot, a_fh, a_fv, a_sq, a_width, a_bri, a_con, a_sat, a_shp, a_blur, a_gray],
+                a_out,
             )
 
         with gr.Tab("Remove Background"):
