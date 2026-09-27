@@ -1,0 +1,9 @@
+gradio>=5,<7
+pillow>=10
+numpy
+torch>=2.1
+diffusers>=0.30
+transformers>=4.40
+accelerate>=0.30
+# Optional: background removal tab
+rembg[cpu]
