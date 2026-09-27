@@ -20,6 +20,19 @@ Python 3.10 to 3.12, plus hardware that fits the engine you want to use:
 
 The Best engine's hardware figures are estimates for a model of this size and haven't been measured. If it runs out of memory, use the Light engine or rent a cloud GPU (see below).
 
+## Mac mini / Apple Silicon quick start
+
+1. Check your memory: Apple menu → **About This Mac** → **Memory**.
+2. Install Python 3.12 from https://www.python.org/downloads/macos/ if you don't have it (`python3 --version` in Terminal).
+3. Follow **Install** and **Run** below. Skip the NVIDIA step.
+
+| Your Mac's memory | What runs locally |
+|---|---|
+| 16 / 24 / 32 GB | **Light** engine, Inpaint, Adjust, Remove Background. The Best engine is disabled automatically so it won't start a 60 GB download it can't use. |
+| 64 GB+ (M4 Pro) | Everything, including the **Best** engine. Expect minutes per edit, not seconds. |
+
+For Best-quality edits on a smaller Mac, run the app on a rented GPU (see **No suitable GPU?**) and open it from your Mac's browser.
+
 ## Install
 
 ```bash

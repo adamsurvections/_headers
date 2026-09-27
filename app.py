@@ -17,6 +17,11 @@ works even if you have not installed the AI dependencies yet.
 
 import argparse
 import functools
+import os
+import platform
+
+# Let PyTorch fall back to the CPU for any operation Apple's GPU (MPS) does not support yet.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import gradio as gr
 import numpy as np
@@ -27,6 +32,19 @@ INSTRUCT_MODEL = "timbrooks/instruct-pix2pix"
 SAFETY_MODEL = "CompVis/stable-diffusion-safety-checker"
 ENGINE_BEST = "Best quality (Qwen-Image-Edit)"
 ENGINE_LIGHT = "Light / fast (InstructPix2Pix)"
+IS_MAC = platform.system() == "Darwin"
+BEST_MIN_MAC_RAM_GB = 64  # full-precision Qwen-Image-Edit needs roughly 60 GB of unified memory
+
+
+def _ram_gb():
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1024**3
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+RAM_GB = _ram_gb()
+BEST_FITS_MAC = not IS_MAC or (RAM_GB or 0) >= BEST_MIN_MAC_RAM_GB - 2
 INPAINT_MODEL = "stable-diffusion-v1-5/stable-diffusion-inpainting"
 
 
@@ -181,6 +199,11 @@ def ai_edit(img, ref, instruction, engine, steps, strength, keep, low_vram, seed
         raise gr.Error("Upload an image first.")
     if not instruction.strip():
         raise gr.Error("Describe the edit you want, e.g. 'replace the background with a beach at sunset'.")
+    if engine == ENGINE_BEST and not BEST_FITS_MAC:
+        raise gr.Error(
+            f"This Mac has {RAM_GB:.0f} GB of memory; the Best engine needs about {BEST_MIN_MAC_RAM_GB} GB. "
+            "Use the Light engine, or run the app on a rented GPU (see README)."
+        )
     gen, seed = _generator(seed)
     img = img.convert("RGB")
 
@@ -302,7 +325,12 @@ def build_ui():
                         lines=3,
                         placeholder="e.g. change the background to a modern office, keep the person exactly the same",
                     )
-                    e_engine = gr.Radio([ENGINE_BEST, ENGINE_LIGHT], value=ENGINE_BEST, label="Engine")
+                    e_engine = gr.Radio(
+                        [ENGINE_BEST, ENGINE_LIGHT],
+                        value=ENGINE_BEST if BEST_FITS_MAC else ENGINE_LIGHT,
+                        label="Engine",
+                        info=None if BEST_FITS_MAC else f"Best engine needs ~{BEST_MIN_MAC_RAM_GB} GB memory; this Mac has {RAM_GB:.0f} GB.",
+                    )
                     with gr.Accordion("Settings", open=False):
                         e_steps = gr.Slider(10, 60, 40, step=1, label="Steps (more = slower, finer)")
                         e_str = gr.Slider(1, 10, 4, step=0.5, label="Prompt strength")
